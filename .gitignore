@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+*.pyo
+.env
+.venv/
+venv/
+*.egg-info/
+dist/
+build/
+.vscode/
+.claude/
+data/raw/
+data/processed/
+results/
+!results/.gitkeep
