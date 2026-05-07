@@ -1,148 +1,121 @@
-# Project: Predictive Auto-Scaling — R² vs SLA Violation Correlation Study
+# Project: Predictive Auto-Scaling Research
 
-## Overview
-This research project investigates whether higher prediction accuracy (R², MAE) in CPU usage forecasting translates to better operational SLA outcomes (lower SLA violation rates). We use the Google Cluster Trace v3 dataset and Random Forest regression.
+## Structure
 
-## Research Questions
-- **RQ2**: Is there a statistically significant correlation between prediction accuracy (R², MAE) and SLA violation rate?
-- **RQ3**: What is the trade-off between SLA violation reduction and over-provisioning cost in predictive scaling?
+```
+v1/   — BigQuery-based pipeline (RQ2/RQ3, Google Cluster Trace v3)
+v2/   — Local CSV-based pipeline (RQ1, borg_traces_data)
+```
 
-## Dataset
-- **Source**: Google Cluster Trace v3 (BigQuery: `google.com:google-cluster-data`)
-- **Cell**: `clusterdata_2019_a` (use cell A only)
-- **Key tables**: `instance_usage`, `instance_events`, `machine_events`
-- **Documentation**: `docs/Google_cluster-usage_traces_v3.pdf`
+---
 
-## Data Access
-BigQuery project ID is set via environment variable:
+## v1 — RQ2/RQ3: R² vs SLA Violation Correlation
+
+> Original pipeline using Google Cluster Trace v3 via BigQuery.
+> See `v1/` for all source files and docs.
+
+**Research Questions**
+- RQ2: Correlation between prediction accuracy (R², MAE) and SLA violation rate
+- RQ3: Trade-off between SLA violation reduction and over-provisioning cost
+
+**Dataset**: Google Cluster Trace v3 (BigQuery `google.com:google-cluster-data`, cell A)
+
+**Pipeline**: `v1/src/`
+- `data_extraction.py` → BigQuery → `data/raw/`
+- `feature_engineering.py` → `data/processed/`
+- `model.py` → 7 RF variants with deliberately varied R²
+- `sla_simulation.py` → violation rate + over-provisioning cost
+- `visualization.py` → publication plots
+- `run_pipeline.py` → runs all steps
+
+**Data Access**:
 ```bash
 export GCP_PROJECT_ID="your-project-id-here"
+python v1/src/run_pipeline.py
 ```
 
-## Pipeline
+---
 
-### 1. Data Extraction (`src/data_extraction.py`)
-Extract sampled data from BigQuery and save to `data/raw/`.
+## v2 — RQ1: Tier-Aware Prediction (Production vs Non-prod)
 
-**instance_usage query requirements**:
-- Filter: cell A, first 7 days of trace (keep costs low)
-- Sample: ~1M rows max
-- Fields needed: start_time, end_time, collection_id, instance_index, machine_id, collection_type, average_usage (cpus, memory), maximum_usage (cpus, memory), resource_request (cpus, memory), assigned_memory, cycles_per_instruction, memory_accesses_per_instruction, cpu_usage_distribution, sample_rate
+> Local CSV pipeline, no BigQuery needed.
 
-**instance_events query requirements**:
-- Filter: matching collection_ids from instance_usage
-- Fields needed: time, type, collection_id, instance_index, machine_id, priority, scheduling_class, collection_type, resource_request, alloc_collection_id
+**Dataset**: `C:\Users\hynbb\Desktop\borg_traces_data - Copy.csv` (1,324,694 rows)
 
-**machine_events query requirements**:
-- Fields needed: time, machine_id, type, capacity (cpus, memory)
-- Only ADD/UPDATE events (for capacity info)
+**Key columns**:
+- `priority`: tier classification (120–359 = Production, else Non-prod)
+- `average_usage`: `{'cpus': X, 'memory': Y}` — parsed to `avg_cpu`, `avg_mem`
+- `resource_request`: `{'cpus': X, 'memory': Y}` — parsed to `resource_request_cpu/memory`
+- `start_time`: temporal features
+- `cpu_usage_distribution`: p90 extraction (index 9)
+- `tail_cpu_usage_distribution`: p95 extraction (index 0)
+- `failed`: reserved for RQ3 — do not use in v2
 
-### 2. Feature Engineering (`src/feature_engineering.py`)
-Join instance_usage with instance_events context. Per instance, per time window:
+**Tier Definition**:
+- Production: `priority` 120–359
+- Non-prod: everything else
 
-**Lag features**:
-- avg_cpu at t-1, t-2, t-3 (previous 3 windows)
-- max_cpu at t-1
-- avg_memory at t-1
+**Targets** (t+1):
+- `avg_cpu_target`
+- `avg_mem_target`
 
-**Statistical features**:
-- Rolling mean and std of avg_cpu over last 6 windows (30 min)
-- 90th and 95th percentile from cpu_usage_distribution
-- cycles_per_instruction, memory_accesses_per_instruction
+**Train/Test Split**: chronological 80/20 — no random shuffle
 
-**Context features** (from instance_events join):
-- priority (integer)
-- scheduling_class (0-3)
-- collection_type (0=job, 1=alloc set)
-- resource_request_cpu, resource_request_memory
+### Feature Set
 
-**Temporal features**:
-- hour_of_day (from timestamp, timezone America/New_York for cell A)
-- day_of_week
+| Group | Features |
+|-------|----------|
+| Lag | avg_cpu_lag1/2/3, avg_mem_lag1, max_cpu_lag1 |
+| Rolling (6-window) | avg_cpu_roll_mean6, avg_cpu_roll_std6 |
+| Percentile | cpu_p90, cpu_p95 |
+| Hardware | cycles_per_instruction, memory_accesses_per_instruction |
+| Context | priority, scheduling_class, resource_request_cpu, resource_request_memory |
+| Temporal | hour_of_day, day_of_week |
+| Tier | is_production |
+| Interaction (B/C only) | prod_x_hour, prod_x_dow, sc_x_std |
 
-**Target variable**: avg_cpu at t+1 (next window's average CPU usage)
+### Models
 
-Drop rows with NaN from lag creation. Save to `data/processed/`.
+| Model | Features | Weights | Notes |
+|-------|----------|---------|-------|
+| A | Base 18 | None | Baseline RF |
+| B | 21 (base + interaction) | None | Interaction features |
+| C | 21 (base + interaction) | prod=3, non-prod=1 | Weighted RF |
 
-### 3. Model Training (`src/model.py`)
-**Model**: scikit-learn RandomForestRegressor
+All models: `n_estimators=100, random_state=42`
 
-**Train/Test split**: Time-based (first 80% chronological = train, last 20% = test). NO random split.
+### Evaluation
 
-**Hyperparameter tuning**: GridSearchCV with TimeSeriesSplit(n_splits=3)
-- n_estimators: [100, 300, 500]
-- max_depth: [10, 20, 30, None]
-- min_samples_split: [2, 5, 10]
+Per model, report:
+- Overall: R², MAE, RMSE
+- Production tier only: R²_prod, MAE_prod, RMSE_prod
 
-**Evaluation metrics**: R², MAE, RMSE
+### Output Files
 
-**Model variants for RQ2**: Create 6+ models with deliberately varied R² levels:
-- Full model (all features, best hyperparams)
-- Reduced features (lag only)
-- Reduced features (stats only)
-- Shallow trees (max_depth=3)
-- Shallow trees (max_depth=5)
-- Small forest (n_estimators=10)
-- Minimal model (1 lag feature only)
+- `v2/results/rq1_model_comparison.csv`
+- `v2/results/predictions_per_instance.csv`
+  - Columns: instance_id, actual_cpu, predicted_cpu, actual_mem, predicted_mem, priority, is_production, cpu_status, mem_status
+  - cpu overload: predicted > resource_request_cpu
+  - cpu underload: predicted < resource_request_cpu × 0.5
+  - (same logic for memory)
+- `v2/results/feature_importance.csv`
+- `v2/results/pipeline.log`
 
-Save each model's R², MAE, RMSE and predictions to `results/`.
+### Running v2
 
-### 4. SLA Simulation (`src/sla_simulation.py`)
-
-**SLA violation definition (proxy)**:
-- Primary: `actual_cpu > provisioned_capacity` for a given window
-- Where `provisioned_capacity` = scaling decision based on predicted CPU
-
-**Scaling simulation logic**:
-For each threshold τ in [0.5, 0.6, 0.7, 0.8, 0.9]:
-- If predicted_cpu > τ * current_capacity → scale out (provision = predicted * safety_margin)
-- Else → keep current provisioning (provision = resource_request)
-- violation = 1 if actual_cpu > provisioned, else 0
-
-**Calculate for each model variant × each threshold**:
-```
-sla_violation_rate = count(violation==1) / count(total_windows)
-over_provision_cost = sum(provisioned - actual) / sum(actual)  [only where provisioned > actual]
+```bash
+cd v2
+pip install -r requirements.txt
+python src/run_pipeline.py
+# or with explicit path:
+python src/run_pipeline.py --csv "C:/Users/hynbb/Desktop/borg_traces_data - Copy.csv"
 ```
 
-**Baseline**: Reactive scaling — use actual_cpu at time t to provision for t+1 (no prediction, just previous value)
+---
 
-**RQ2 analysis**:
-- Scatter plot: X=R², Y=SLA violation rate (one point per model variant)
-- Compute Pearson and Spearman correlation coefficients
-- Test statistical significance (p-value)
-
-**RQ3 analysis**:
-- Pareto frontier plot: X=SLA violation rate, Y=over-provisioning cost
-- Compare predictive (RF) vs reactive baseline
-- One curve per model variant
-
-### 5. Visualization (`src/visualization.py`)
-Generate publication-quality plots (matplotlib, IEEE style):
-1. R² vs SLA violation rate scatter + correlation line + r/p values
-2. Pareto frontier (violation rate vs over-provisioning cost)
-3. Feature importance bar plot (top 15 features)
-4. Actual vs Predicted CPU scatter plot (best model)
-5. Time series plot: actual vs predicted for a sample instance
-
-Save all plots to `results/plots/` as PNG (300 dpi) and PDF.
-
-## Code Style
+## Code Style (both versions)
 - Python 3.10+
 - Type hints
 - Docstrings for all functions
-- Logging with `logging` module (not print)
-- Each script runnable standalone: `python src/data_extraction.py`
-- Also provide `src/run_pipeline.py` that runs everything in sequence
-
-## Dependencies
-```
-pandas
-numpy
-scikit-learn
-matplotlib
-seaborn
-google-cloud-bigquery
-pyarrow
-scipy
-```
+- `logging` module (not print)
+- Each script runnable standalone
